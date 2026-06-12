@@ -38,6 +38,9 @@ type TableDef struct {
 	Cols   []string // column names
 	PKeys  int      // the first PKeys columns are primary keys
 	Prefix uint32   // B+Tree prefix
+	Indexes [][]string
+	IndexPrefix []uint32
+
 }
 
 // internal table: metadata

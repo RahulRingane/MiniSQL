@@ -19,11 +19,21 @@ const TABLE_PREFIX_MIN = 1
 type InsertReq struct {
 	tree *BTree
 	// out
-	Added bool // added a new key
+	Added   bool   // added a new key
+	Updated bool   // added a new key or an old key was changed
+	Old     []byte // the value before the update
 	// in
 	Key   []byte
 	Value []byte
 	Mode  int
+}
+
+type DeleteReq struct {
+	tree *BTree
+	// in
+	Key []byte
+	// out
+	Old []byte
 }
 
 func (db *DB) TableNew(tdef *TableDef) error {
@@ -52,19 +62,43 @@ func (db *DB) TableNew(tdef *TableDef) error {
 		meta.AddStr("val", make([]byte, 4))
 	}
 
-	binary.LittleEndian.PutUint32(meta.Get("val").Str, tdef.Prefix+1)
-	_, err = dbUpdate(db, TDEF_META, *meta, 0)
+	// binary.LittleEndian.PutUint32(meta.Get("val").Str, tdef.Prefix+1)
+	// _, err = dbUpdate(db, TDEF_META, *meta, 0)
+	// if err != nil {
+	// 	return err
+	// }
+
+	for i := range tdef.Indexes {
+	prefix := tdef.Prefix + 1 + uint32(i)
+	tdef.IndexPrefix = append(tdef.IndexPrefix, prefix)
+   }
+
+    ntree := 1 + uint32(len(tdef.IndexPrefix))
+    binary.LittleEndian.PutUint32(meta.Get("val").Str, tdef.Prefix+ntree)
+
+    _, err = dbUpdate(db, TDEF_META, *meta, 0)
+    if err != nil {
+	return err
+   }
+
+ // verifying the indexes
+ for i, c := range tdef.Indexes {
+	index, err := checkIndexKeys(tdef, c)
 	if err != nil {
 		return err
 	}
+	tdef.Indexes[i] = index
+ }
 
-	val, err := json.Marshal(tdef)
+ val, err := json.Marshal(tdef)
 	if err != nil {
 		return err
 	}
 	table.AddStr("def", val)
-	_, err = dbUpdate(db, TDEF_TABLE, *table, 0)
-	return err
+_, err = dbUpdate(db, TDEF_TABLE, *table, 0)
+
+
+return err
 }
 
 func (db *DB) Set(table string, rec Record, mode int) (bool, error) {
@@ -95,23 +129,96 @@ func (db *DB) Delete(table string, rec Record) (bool, error) {
 	return dbDelete(db, tdef, rec)
 }
 
+// func dbDelete(db *DB, tdef *TableDef, rec Record) (bool, error) {
+// 	values, err := checkRecord(tdef, rec, tdef.PKeys)
+// 	if err != nil {
+// 		return false, err
+// 	}
+// 	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
+// 	return db.kv.Delete(key)
+// }
+
 func dbDelete(db *DB, tdef *TableDef, rec Record) (bool, error) {
 	values, err := checkRecord(tdef, rec, tdef.PKeys)
 	if err != nil {
 		return false, err
 	}
+
 	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
-	return db.kv.Delete(key)
+
+	req := DeleteReq{
+		Key: key,
+	}
+
+	deleted, err := db.kv.Delete(&req)
+
+	if !deleted || err != nil || len(tdef.Indexes) == 0 {
+		return deleted, err
+	}
+
+	// Decode the deleted row so we know the indexed column values.
+	oldVals, err := decodeValues(req.Old, tdef.Types[tdef.PKeys:])
+if err != nil {
+	return false, err
 }
+
+copy(values[tdef.PKeys:], oldVals)
+
+indexOp(db, tdef, Record{tdef.Cols, values}, INDEX_DEL)
+
+	return deleted, nil
+}
+
+// func dbUpdate(db *DB, tdef *TableDef, rec Record, mode int) (bool, error) {
+// 	values, err := checkRecord(tdef, rec, len(tdef.Cols))
+// 	if err != nil {
+// 		return false, err
+// 	}
+// 	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
+// 	vals := encodeValues(nil, values[tdef.PKeys:])
+// 	return db.kv.SetWithMode(key, vals, mode)
+// }
 
 func dbUpdate(db *DB, tdef *TableDef, rec Record, mode int) (bool, error) {
 	values, err := checkRecord(tdef, rec, len(tdef.Cols))
 	if err != nil {
 		return false, err
 	}
+
 	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
 	vals := encodeValues(nil, values[tdef.PKeys:])
-	return db.kv.SetWithMode(key, vals, mode)
+
+	req := InsertReq{
+		Key:   key,
+		Value: vals,
+		Mode:  mode,
+	}
+
+	added, err := db.kv.SetWithMode(&req)
+
+	// If nothing changed or there are no indexes, we're done.
+	if err != nil || !req.Updated || len(tdef.Indexes) == 0 {
+		return added, err
+	}
+
+	// Existing row updated: remove old index entries first.
+	if req.Updated && !req.Added {
+		oldVals, err := decodeValues(req.Old, tdef.Types[tdef.PKeys:])
+if err != nil {
+	return false, err
+}
+
+copy(values[tdef.PKeys:], oldVals)
+
+indexOp(db, tdef, Record{tdef.Cols, values}, INDEX_DEL)
+	}
+
+	// Insert new index entries.
+	if req.Updated {
+		indexOp(db, tdef, rec, INDEX_ADD)
+	}
+
+	return added, nil
 }
 
 func (tree *BTree) InsertEx(req *InsertReq) {
@@ -144,24 +251,85 @@ func (tree *BTree) InsertEx(req *InsertReq) {
 	}
 }
 
-func (db *KV) SetWithMode(key []byte, val []byte, mode int) (bool, error) {
-	switch mode {
+// func (tree *BTree) DeleteEx(req *DeleteReq) {
+// 	if tree == nil || req == nil {
+// 		return
+// 	}
+
+// 	// Check if the key exists
+// 	key, exists := tree.Get(req.Key)
+// 	if !exists {
+// 		return
+// 	}
+
+// 	isDeleted := tree.Delete(key)
+// 	if isDeleted {
+// 		req.Old = key
+// 	}
+// }
+
+// func (db *KV) SetWithMode(key []byte, val []byte, mode int) (bool, error) {
+// 	switch mode {
+// 	case MODE_UPDATE_ONLY:
+// 		_, exists := db.Get(key)
+// 		if exists {
+// 			err := db.Set(key, val)
+// 			return true, err
+// 		}
+// 		return false, errors.New("key does not exist")
+
+// 	case MODE_UPSERT:
+// 		err := db.Set(key, val)
+// 		return true, err
+
+// 	case MODE_INSERT_ONLY:
+// 		_, exists := db.Get(key)
+// 		if !exists {
+// 			err := db.Set(key, val)
+// 			return true, err
+// 		}
+// 		return false, errors.New("key already exists")
+
+// 	default:
+// 		return false, errors.New("invalid update mode")
+// 	}
+// }
+
+func (db *KV) SetWithMode(req *InsertReq) (bool, error) {
+	switch req.Mode {
+
 	case MODE_UPDATE_ONLY:
-		_, exists := db.Get(key)
+		old, exists := db.Get(req.Key)
 		if exists {
-			err := db.Set(key, val)
+			err := db.Set(req.Key, req.Value)
+
+			req.Updated = true
+			req.Old = old
+
 			return true, err
 		}
 		return false, errors.New("key does not exist")
 
 	case MODE_UPSERT:
-		err := db.Set(key, val)
+		old, exists := db.Get(req.Key)
+		if exists {
+			req.Old = old
+		}
+
+		err := db.Set(req.Key, req.Value)
+
+		req.Updated = true
+
 		return true, err
 
 	case MODE_INSERT_ONLY:
-		_, exists := db.Get(key)
+		_, exists := db.Get(req.Key)
 		if !exists {
-			err := db.Set(key, val)
+			err := db.Set(req.Key, req.Value)
+
+			req.Added = true
+			req.Updated = true
+
 			return true, err
 		}
 		return false, errors.New("key already exists")
@@ -171,32 +339,68 @@ func (db *KV) SetWithMode(key []byte, val []byte, mode int) (bool, error) {
 	}
 }
 
-func tableDefCheck(tdef *TableDef) error {
+// func tableDefCheck(tdef *TableDef) error {
 
+// 	if tdef.Name == "" {
+// 		return errors.New("table name cannot be empty")
+// 	}
+
+// 	if !isValidTableName(tdef.Name) {
+// 		return errors.New("invalid table name")
+// 	}
+
+// 	if len(tdef.Cols) == 0 {
+// 		return errors.New("table must have at least one column")
+// 	}
+
+// 	if len(tdef.Cols) != len(tdef.Types) {
+// 		return errors.New("number of columns and types must match")
+// 	}
+
+// 	if tdef.PKeys < 1 || tdef.PKeys > len(tdef.Cols) {
+// 		return errors.New("invalid primary key count")
+// 	}
+
+// 	columnNames := make(map[string]bool)
+
+// 	for i, col := range tdef.Cols {
+
+// 		if col == "" {
+// 			return errors.New("column name cannot be empty")
+// 		}
+
+// 		if columnNames[col] {
+// 			return fmt.Errorf("duplicate column name: %s", col)
+// 		}
+
+// 		columnNames[col] = true
+
+// 		if tdef.Types[i] != TYPE_BYTES &&
+// 			tdef.Types[i] != TYPE_INT64 {
+// 			return fmt.Errorf("invalid data type for column %s", col)
+// 		}
+// 	}
+
+// 	return nil
+// }
+
+func tableDefCheck(tdef *TableDef) error {
 	if tdef.Name == "" {
 		return errors.New("table name cannot be empty")
 	}
 
-	if !isValidTableName(tdef.Name) {
-		return errors.New("invalid table name")
-	}
+	// if !isValidTableName(tdef.Name) {
+	// 	return errors.New("invalid table name")
+	// }
 
 	if len(tdef.Cols) == 0 {
 		return errors.New("table must have at least one column")
 	}
 
-	if len(tdef.Cols) != len(tdef.Types) {
-		return errors.New("number of columns and types must match")
-	}
-
-	if tdef.PKeys < 1 || tdef.PKeys > len(tdef.Cols) {
-		return errors.New("invalid primary key count")
-	}
-
+	// Track column names to check for duplicates
 	columnNames := make(map[string]bool)
 
 	for i, col := range tdef.Cols {
-
 		if col == "" {
 			return errors.New("column name cannot be empty")
 		}
@@ -213,9 +417,16 @@ func tableDefCheck(tdef *TableDef) error {
 		}
 	}
 
+	if tdef.PKeys > 1 {
+		return errors.New("only one primary key is allowed")
+	}
+
 	return nil
 }
 
+// func isValidTableName(name string) bool {
+// 	return regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`).MatchString(name)
+// }
 func isValidTableName(name string) bool {
 	return regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`).MatchString(name)
 }

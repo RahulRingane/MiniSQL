@@ -58,8 +58,11 @@ func StoreImpl() {
 			fmt.Print("Enter key: ")
 			key, _ := scanner.ReadString('\n')
 			key = strings.TrimSpace(key)
-
-			db.Delete([]byte(key))
+			req := DeleteReq{Key: []byte(key)}
+            _, err := db.Delete(&req)
+            if err != nil {
+	        fmt.Println(err)
+            }
 
 		case "GET":
 			fmt.Print("Enter key: ")

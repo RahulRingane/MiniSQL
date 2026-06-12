@@ -94,13 +94,31 @@ func (db *KV) Get(key []byte) ([]byte, bool) {
 }
 
 func (db *KV) Set(key, val []byte) error {
+	  prefix := binary.BigEndian.Uint32(key[:4])
+
+    fmt.Printf(
+        "Tree=%p Prefix=%d Key=%x\n",
+        &db.tree,
+        prefix,
+        key,
+    )
 	db.tree.Insert(key, val)
 	return flushPages(db)
 }
 
-func (db *KV) Delete(key []byte) (bool, error) {
-	deleted := db.tree.Delete(key)
-	return deleted, flushPages(db)
+func (db *KV) Delete(req *DeleteReq) (bool, error) {
+	val, exists := db.Get(req.Key)
+if !exists {
+    return false, nil
+}
+
+deleted := db.tree.Delete(req.Key)
+
+if deleted {
+    req.Old = val
+}
+
+return deleted, flushPages(db)
 }
 
 // persist the newly allocated pages after updates
