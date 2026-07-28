@@ -1,3 +1,5 @@
-module atomixDB
+module MiniSQL
 
-go 1.18
+go 1.23.2
+
+require golang.org/x/sys v0.31.0 // indirect

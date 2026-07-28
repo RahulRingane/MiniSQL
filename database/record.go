@@ -13,6 +13,12 @@ const (
 	TYPE_BYTES = 2
 )
 
+// table row
+type Record struct {
+	Cols []string
+	Vals []Value
+}
+
 // table cell
 type Value struct {
 	Type uint32
@@ -20,248 +26,210 @@ type Value struct {
 	Str  []byte
 }
 
-// table row
-type Record struct {
-	Cols []string
-	Vals []Value
-}
-
 type DB struct {
 	Path   string
 	kv     KV
+	pool   *WorkerPool
 	tables map[string]*TableDef // cached table definition
 }
 
 type TableDef struct {
-	Name   string
-	Types  []uint32 // column types
-	Cols   []string // column names
-	PKeys  int      // the first PKeys columns are primary keys
-	Prefix uint32   // B+Tree prefix
+	Name    string
+	Types   []uint32 // column types
+	Cols    []string // column names
+	PKeys   int      // the first `PKeys` columns are the pimary key
 	Indexes [][]string
+	// auto-assigned B-tree key prefixes for different tables/indexes
+	Prefix      uint32
 	IndexPrefix []uint32
-
 }
 
 // internal table: metadata
 var TDEF_META = &TableDef{
-	Prefix: 1,
-	Name:   "@meta",
-	Types:  []uint32{TYPE_BYTES, TYPE_BYTES},
-	Cols:   []string{"key", "val"},
-	PKeys:  1,
+	Name:        "@meta",
+	Types:       []uint32{TYPE_BYTES, TYPE_BYTES},
+	Cols:        []string{"key", "val"},
+	PKeys:       1,
+	Indexes:     make([][]string, 0),
+	Prefix:      1,
+	IndexPrefix: make([]uint32, 0),
 }
 
 // internal table: table schemas
 var TDEF_TABLE = &TableDef{
-	Prefix: 2,
-	Name:   "@table",
-	Types:  []uint32{TYPE_BYTES, TYPE_BYTES},
-	Cols:   []string{"name", "def"},
-	PKeys:  1,
+	Name:        "@table",
+	Types:       []uint32{TYPE_BYTES, TYPE_BYTES},
+	Cols:        []string{"name", "def"},
+	PKeys:       1,
+	Indexes:     make([][]string, 0),
+	Prefix:      2,
+	IndexPrefix: make([]uint32, 0),
 }
 
 func (rec *Record) AddStr(key string, val []byte) *Record {
 	rec.Cols = append(rec.Cols, key)
-	rec.Vals = append(rec.Vals, Value{
-		Type: TYPE_BYTES,
-		Str:  val,
-	})
+	rec.Vals = append(rec.Vals, Value{Type: 2, Str: val})
 	return rec
 }
 
 func (rec *Record) AddInt64(key string, val int64) *Record {
 	rec.Cols = append(rec.Cols, key)
-	rec.Vals = append(rec.Vals, Value{
-		Type: TYPE_INT64,
-		I64:  val,
-	})
+	rec.Vals = append(rec.Vals, Value{Type: 1, I64: val})
 	return rec
 }
 
 func (rec *Record) Get(key string) *Value {
 	for i, col := range rec.Cols {
-		if col == key {
+		if key == col {
 			return &rec.Vals[i]
 		}
 	}
 	return nil
 }
 
-func (db *DB) Get(table string, rec *Record) (bool, error) {
-	tdef := getTableDef(db, table)
-	if tdef == nil {
-		return false, fmt.Errorf("table not found: %s", table)
-	}
-	return dbGet(db, tdef, rec)
-}
-
-func getTableDef(db *DB, name string) *TableDef {
+func GetTableDef(db *DB, name string, tree *BTree) *TableDef {
 	tdef, ok := db.tables[name]
 	if !ok {
 		if db.tables == nil {
 			db.tables = map[string]*TableDef{}
 		}
-
-		tdef = getTableDefDB(db, name)
-
+		tdef = getTableDefDB(db, name, tree)
 		if tdef != nil {
 			db.tables[name] = tdef
 		}
 	}
-
 	return tdef
 }
 
-func getTableDefDB(db *DB, name string) *TableDef {
+func getTableDefDB(db *DB, name string, tree *BTree) *TableDef {
 	rec := (&Record{}).AddStr("name", []byte(name))
-
-	ok, err := dbGet(db, TDEF_TABLE, rec)
-	if err != nil || !ok {
+	// get the tdef from the `BTree` using the PKey - `name`
+	ok, err := dbGet(db, TDEF_TABLE, rec, tree)
+	if err != nil {
 		return nil
 	}
-
+	if !ok {
+		return nil
+	}
 	tdef := &TableDef{}
-
-	if err := json.Unmarshal(rec.Get("def").Str, tdef); err != nil {
+	// Verify Once
+	if rec.Get("def").Str != nil {
+		err = json.Unmarshal(rec.Get("def").Str, tdef)
+	}
+	if err != nil {
+		fmt.Println("Err while Unmarshal: ", err.Error())
 		return nil
 	}
-
 	return tdef
 }
 
 // get row by primary key
-func dbGet(db *DB, tdef *TableDef, rec *Record) (bool, error) {
+func dbGet(db *DB, tdef *TableDef, rec *Record, tree *BTree) (bool, error) {
 	sc := Scanner{
 		Cmp1: CMP_GE,
-		Key1: *rec,
 		Cmp2: CMP_LE,
+		Key1: *rec,
 		Key2: *rec,
 	}
-
-	if err := dbScan(db, tdef, &sc); err != nil {
+	if err := dbScan(db, tdef, &sc, tree); err != nil {
 		return false, err
 	}
-
-	if !sc.Valid() {
+	if sc.Valid() {
+		sc.Deref(rec, tree)
+		return true, nil
+	} else {
 		return false, nil
 	}
-
-	sc.Deref(rec)
-	return true, nil
 }
 
 func encodeKey(out []byte, prefix uint32, vals []Value) []byte {
 	var buf [4]byte
-
 	binary.BigEndian.PutUint32(buf[:], prefix)
-
 	out = append(out, buf[:]...)
 	out = encodeValues(out, vals)
-
 	return out
+}
+
+func dbGetRange(db *DB, tdef *TableDef, start *Record, end *Record, tree *BTree) ([]*Record, error) {
+	sc := Scanner{
+		Cmp1: CMP_GE,
+		Cmp2: CMP_LE,
+		Key1: *start,
+		Key2: *end,
+	}
+
+	if err := dbScan(db, tdef, &sc, tree); err != nil {
+		return nil, err
+	}
+
+	var results []*Record
+	for sc.Valid() {
+		rec := &Record{
+			Cols: make([]string, len(tdef.Cols)),
+			Vals: make([]Value, len(tdef.Cols)),
+		}
+		copy(rec.Cols, tdef.Cols)
+		sc.Deref(rec, tree)
+		results = append(results, rec)
+		sc.Next()
+	}
+
+	return results, nil
 }
 
 func encodeValues(out []byte, vals []Value) []byte {
 	for _, v := range vals {
-
 		switch v.Type {
-
 		case TYPE_INT64:
 			var buf [8]byte
-
 			u := uint64(v.I64) + (1 << 63)
-
 			binary.BigEndian.PutUint64(buf[:], u)
-
 			out = append(out, buf[:]...)
-
 		case TYPE_BYTES:
+			if v.Str == nil {
+				out = append(out, 0)
+				continue
+			}
 			out = append(out, escapeString(v.Str)...)
 			out = append(out, 0)
-
 		default:
-			panic("invalid type")
+			panic("invalid type while encodeValues")
 		}
 	}
-
 	return out
 }
 
-func decodeValues(in []byte, types []uint32) ([]Value, error) {
-	values := make([]Value, 0, len(types))
-	index := 0
-
-	for _, typ := range types {
-		switch typ {
-
+func decodeValues(in []byte, out []Value) {
+	remaining := in
+	for i, v := range out {
+		switch v.Type {
 		case TYPE_INT64:
-			if index+8 > len(in) {
-				return nil, fmt.Errorf("invalid int64 encoding")
+			if len(remaining) < 8 {
+				return
 			}
-
-			u := binary.BigEndian.Uint64(in[index : index+8])
-
-			values = append(values, Value{
-				Type: TYPE_INT64,
-				I64:  int64(u - (1 << 63)),
-			})
-
-			index += 8
-
+			u := binary.BigEndian.Uint64(remaining[:8])
+			val := int64(u - (1 << 63))
+			out[i] = Value{Type: TYPE_INT64, I64: val}
+			remaining = remaining[8:]
 		case TYPE_BYTES:
-			start := index
-
-			for index < len(in) {
-				if in[index] == 0 {
-					break
-				}
-
-				// Skip escaped byte (0x01 xx)
-				if in[index] == 0x01 {
-					if index+1 >= len(in) {
-						return nil, fmt.Errorf("invalid escaped string")
-					}
-					index += 2
-				} else {
-					index++
-				}
+			end := 0
+			for end < len(remaining) && remaining[end] != 0 {
+				end++
 			}
-
-			if index >= len(in) {
-				return nil, fmt.Errorf("unterminated string")
+			if end >= len(remaining) {
+				return
 			}
-
-			values = append(values, Value{
-				Type: TYPE_BYTES,
-				Str:  unescapeString(in[start:index]),
-			})
-
-			index++ // Skip null terminator
-
+			unEscStr := unEscapeString(remaining[:end])
+			out[i] = Value{Type: TYPE_BYTES, Str: unEscStr}
+			remaining = remaining[end+1:]
 		default:
-			return nil, fmt.Errorf("unknown type %d", typ)
+			panic("invalid type while decodeValues")
 		}
 	}
-
-	if index != len(in) {
-		return nil, fmt.Errorf("extra bytes at end of value")
-	}
-
-	return values, nil
 }
 
-func decodeKey(in []byte, types []uint32) ([]Value, error) {
-	if len(in) < 4 {
-		return nil, fmt.Errorf("invalid key")
-	}
-
-	// Skip 4-byte table prefix.
-	return decodeValues(in[4:], types)
-}
-
-// Strings are encoded as null-terminated strings.
-// Escape embedded '\0' and '\1' bytes.
+// Strings are encoded as nul terminated strings,
+// escape the nul byte so that strings contain no nul byte.
 func escapeString(in []byte) []byte {
 	zeros := bytes.Count(in, []byte{0})
 	ones := bytes.Count(in, []byte{1})
@@ -269,31 +237,33 @@ func escapeString(in []byte) []byte {
 	if zeros+ones == 0 {
 		return in
 	}
-
 	out := make([]byte, len(in)+zeros+ones)
-
 	pos := 0
+	if len(in) > 0 && in[0] >= 0xfe {
+		out[0] = 0xfe
+		out[1] = in[0]
+		pos += 2
+		in = in[1:]
+	}
 	for _, ch := range in {
-		if ch <= 1 {
-			out[pos] = 0x01
+		if ch <= 1 { // if null character found
+			out[pos+0] = 0x01 // replace null character by escaping character
 			out[pos+1] = ch + 1
 			pos += 2
 		} else {
 			out[pos] = ch
-			pos++
+			pos += 1
 		}
 	}
-
 	return out
 }
 
-func unescapeString(in []byte) []byte {
+func unEscapeString(in []byte) []byte {
 	if len(in) == 0 {
 		return in
 	}
 
 	escapeCount := 0
-
 	for i := 0; i < len(in); i++ {
 		if in[i] == 0x01 && i+1 < len(in) {
 			escapeCount++
@@ -301,22 +271,34 @@ func unescapeString(in []byte) []byte {
 		}
 	}
 
-	if escapeCount == 0 {
+	if escapeCount == 0 && (len(in) == 0 || in[0] != 0xfe) {
 		return in
 	}
-
-	out := make([]byte, len(in)-escapeCount)
-
+	outLen := len(in) - escapeCount
+	if in[0] == 0xfe {
+		outLen--
+	}
+	out := make([]byte, outLen)
 	pos := 0
+	i := 0
+	if in[0] == 0xfe {
+		if len(in) < 2 {
+			return in
+		}
+		out[pos] = in[1]
+		pos++
+		i += 2
+	}
 
-	for i := 0; i < len(in); i++ {
+	for i < len(in) {
 		if in[i] == 0x01 && i+1 < len(in) {
 			out[pos] = in[i+1] - 1
 			pos++
-			i++
+			i += 2
 		} else {
 			out[pos] = in[i]
 			pos++
+			i++
 		}
 	}
 
@@ -326,42 +308,27 @@ func unescapeString(in []byte) []byte {
 func checkRecord(tdef *TableDef, rec Record, n int) ([]Value, error) {
 	orderedValues := make([]Value, len(tdef.Cols))
 
-	var limit int
-
-	switch n {
-	case tdef.PKeys:
-		limit = tdef.PKeys
-
-	case len(tdef.Cols):
-		limit = len(tdef.Cols)
-
-	default:
-		return nil, fmt.Errorf("invalid number of columns")
+	if n == tdef.PKeys {
+		for i := 0; i < tdef.PKeys; i++ {
+			if !contains(rec.Cols, tdef.Cols[i]) {
+				return nil, fmt.Errorf("missing primary key column: %s", tdef.Cols[i])
+			}
+			index := indexOf(rec.Cols, tdef.Cols[i])
+			orderedValues[i] = rec.Vals[index]
+		}
 	}
 
-	for i := 0; i < limit; i++ {
-		idx := indexOf(rec.Cols, tdef.Cols[i])
-
-		if idx == -1 {
-			return nil, fmt.Errorf("missing column: %s", tdef.Cols[i])
+	if n == len(tdef.Cols) {
+		for i, col := range tdef.Cols {
+			if !contains(rec.Cols, col) {
+				return nil, fmt.Errorf("missing column: %s", col)
+			}
+			index := indexOf(rec.Cols, col)
+			orderedValues[i] = rec.Vals[index]
 		}
-
-		if rec.Vals[idx].Type != tdef.Types[i] {
-			return nil, fmt.Errorf(
-				"type mismatch for column %s: expected %d, got %d",
-				tdef.Cols[i],
-				tdef.Types[i],
-				rec.Vals[idx].Type,
-			)
-		}
-
-		orderedValues[i] = rec.Vals[idx]
 	}
-
 	return orderedValues, nil
 }
-
-// Helper functions
 
 func contains(slice []string, item string) bool {
 	for _, v := range slice {

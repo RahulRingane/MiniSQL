@@ -3,6 +3,7 @@ package database
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 )
 
 type BNode struct {
@@ -19,7 +20,7 @@ type BNode struct {
 
 // Format of KV pair
 // | klen | vlen | key | val |
-// | 2B   | 2B   | ... | ... | 
+// | 2B   | 2B   | ... | ... |
 
 type BTree struct {
 	// a pointer (a non-zero page number)
@@ -30,53 +31,42 @@ type BTree struct {
 	del func(uint64)       // de-allocate the page
 }
 
-func (tree *BTree) Insert(key, val []byte) {
-	assert(len(key) != 0)
-	assert(len(key) <= BTREE_MAX_KEY_SIZE)
-	assert(len(val) <= BTREE_MAX_VAL_SIZE)
+func (tree *BTree) Insert(key, val []byte) error {
+	if len(key) == 0 || len(key) > BTREE_MAX_KEY_SIZE {
+		return errors.New("key size not valid")
+	}
+	if len(val) > BTREE_MAX_VAL_SIZE {
+		return errors.New("val size exceeds the max size")
+	}
 
 	if tree.root == 0 {
 		root := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
 		root.setHeader(BNODE_LEAF, 2)
-
-		// Dummy key covers whole key space
+		// a dummy key, this makes the tree cover the whole key space.
+		// thus a lookup can always find a containing node.
 		nodeAppendKV(root, 0, 0, nil, nil)
 		nodeAppendKV(root, 1, 0, key, val)
-
 		tree.root = tree.new(root)
-		return
+		return nil
 	}
-
 	node := tree.get(tree.root)
 	tree.del(tree.root)
-
-	// Insert into tree
+	// Inserts the KV pair & returns the node
 	node = treeInsert(tree, node, key, val)
-
-	// Split if needed
+	// If the updated node is big we split it
 	nsplit, splitted := nodeSplit3(node)
-
 	if nsplit > 1 {
 		root := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
 		root.setHeader(BNODE_INODE, nsplit)
-
 		for i, knode := range splitted[:nsplit] {
-
-			// Shrink node to actual used size
-			knode.data = knode.data[:knode.nbytes()]
-
 			ptr, key := tree.new(knode), knode.getKey(0)
 			nodeAppendKV(root, uint16(i), ptr, key, nil)
 		}
-
 		tree.root = tree.new(root)
 	} else {
-
-		// Shrink node to actual used size
-		splitted[0].data = splitted[0].data[:splitted[0].nbytes()]
-
 		tree.root = tree.new(splitted[0])
 	}
+	return nil
 }
 
 func (tree *BTree) Delete(key []byte) bool {
@@ -85,7 +75,7 @@ func (tree *BTree) Delete(key []byte) bool {
 	if tree.root == 0 {
 		return false
 	}
-	// Gives the us the new updated node after deleting the key
+	// Gives the new updated node after deleting the key
 	updated := treeDelete(tree, tree.get(tree.root), key)
 	if len(updated.data) == 0 {
 		return false
@@ -99,23 +89,23 @@ func (tree *BTree) Delete(key []byte) bool {
 	return true
 }
 
-func (tree *BTree) Get(key []byte) ([]byte, bool) {
-	assert(len(key) != 0)
-	assert(len(key) <= BTREE_MAX_KEY_SIZE)
-
-	if tree.root == 0 {
-		return nil, false
+func (tree *BTree) Get(key []byte) ([]byte, bool, error) {
+	if len(key) == 0 || len(key) > BTREE_MAX_KEY_SIZE {
+		return nil, false, errors.New("key size is not valid")
 	}
 
+	if tree.root == 0 {
+		return nil, false, nil
+	}
 	node := tree.get(tree.root)
 	for {
 		switch node.bNodeType() {
 		case BNODE_LEAF:
 			idx := nodeLookupLE(node, key)
 			if bytes.Equal(node.getKey(idx), key) {
-				return node.getVal(idx), true
+				return node.getVal(idx), true, nil
 			}
-			return nil, false
+			return nil, false, nil
 		case BNODE_INODE:
 			idx := nodeLookupLE(node, key)
 			node = tree.get(node.getPtr(idx))
@@ -300,47 +290,18 @@ func nodeSplit3(old BNode) (uint16, [3]BNode) {
 
 func nodeSplit2(left, right, old BNode) {
 	midIndex := old.nKeys() / 2
-
-	leftCount := midIndex
-	rightCount := old.nKeys() - midIndex
-
-	// Initialize node headers
-	left.setHeader(old.bNodeType(), leftCount)
-	right.setHeader(old.bNodeType(), rightCount)
-
-	// Copy keys
-	nodeAppendRange(left, old, 0, 0, leftCount)
-	nodeAppendRange(right, old, 0, midIndex, rightCount)
+	nodeAppendRange(left, old, 0, 0, midIndex)
+	nodeAppendRange(right, old, 0, midIndex, old.nKeys()-1)
 }
 
 func nodeReplaceKidN(tree *BTree, new BNode, old BNode, idx uint16, kids ...BNode) {
 	inc := uint16(len(kids))
-
 	new.setHeader(BNODE_INODE, old.nKeys()+inc-1)
-
 	nodeAppendRange(new, old, 0, 0, idx)
-
 	for i, node := range kids {
-
-		// shrink oversized temporary node
-		node.data = node.data[:node.nbytes()]
-
-		nodeAppendKV(
-			new,
-			idx+uint16(i),
-			tree.new(node),
-			node.getKey(0),
-			nil,
-		)
+		nodeAppendKV(new, idx+uint16(i), tree.new(node), node.getKey(0), nil)
 	}
-
-	nodeAppendRange(
-		new,
-		old,
-		idx+inc,
-		idx+1,
-		old.nKeys()-(idx+1),
-	)
+	nodeAppendRange(new, old, idx+inc, idx+1, old.nKeys()-(idx+1))
 }
 
 func leafInsert(new BNode, old BNode, idx uint16, key, val []byte) {

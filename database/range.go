@@ -15,25 +15,28 @@ const (
 // the iterator for range queries
 type Scanner struct {
 	// the range, from Key1 to Key2
-	Cmp1 int // CMP_??
-	Cmp2 int
-	Key1 Record
-	Key2 Record
+	db      *DB
+	indexNo int // -1: use primary key; >= 0: use an index
+	Cmp1    int
+	Cmp2    int
+	Key1    Record
+	Key2    Record
 	// internal
-	tdef   *TableDef
-	iter   *BIter // underlying BTree iterator
-	keyEnd []byte // the encoded Key2
+	tdef     *TableDef
+	iter     *BIter // underlying BTree iterator
+	keyEnd   []byte // the encoded Key2
+	keyStart []byte // the encoded Key2
 }
 
-func (db *DB) Scan(table string, req *Scanner) error {
-	tdef := getTableDef(db, table)
+func (db *DB) Scan(table string, req *Scanner, tree *BTree) error {
+	tdef := GetTableDef(db, table, tree)
 	if tdef == nil {
 		return fmt.Errorf("table not found: %s", table)
 	}
-	return dbScan(db, tdef, req)
+	return dbScan(db, tdef, req, tree)
 }
 
-func dbScan(db *DB, tdef *TableDef, req *Scanner) error {
+func dbScan(db *DB, tdef *TableDef, req *Scanner, tree *BTree) error {
 	// sanity checks
 	switch {
 	case req.Cmp1 > 0 && req.Cmp2 < 0:
@@ -41,69 +44,103 @@ func dbScan(db *DB, tdef *TableDef, req *Scanner) error {
 	default:
 		return fmt.Errorf("bad range")
 	}
+	indexNo, err := findIndex(tdef, req.Key1.Cols)
+	if err != nil {
+		return err
+	}
+	index, prefix := tdef.Cols[:tdef.PKeys], tdef.Prefix
+	if indexNo >= 0 {
+		index, prefix = tdef.Indexes[indexNo], tdef.IndexPrefix[indexNo]
+	}
 
-	values1, err := checkRecord(tdef, req.Key1, tdef.PKeys)
-	if err != nil {
-		return err
-	}
-	values2, err := checkRecord(tdef, req.Key2, tdef.PKeys)
-	if err != nil {
-		return err
-	}
+	req.db = db
+
 	req.tdef = tdef
-
+	req.indexNo = indexNo
 	// seek to the start key
-	keyStart := encodeKey(nil, tdef.Prefix, values1[:tdef.PKeys])
-	req.keyEnd = encodeKey(nil, tdef.Prefix, values2[:tdef.PKeys])
-	req.iter = db.kv.tree.Seek(keyStart, req.Cmp1)
+	req.keyStart = encodeKeyPartial(nil, prefix, req.Key1.Vals, tdef, index, req.Cmp1)
+	req.keyEnd = encodeKeyPartial(nil, prefix, req.Key2.Vals, tdef, index, req.Cmp2)
+	req.iter = tree.Seek(req.keyStart, req.Cmp1)
 	return nil
 }
 
-// within the range or not
 func (sc *Scanner) Valid() bool {
-	if sc.iter == nil || !sc.iter.Valid() {
+	if !sc.iter.Valid() {
 		return false
 	}
 	key, _ := sc.iter.Deref()
 
-	return cmpOK(key, sc.Cmp2, sc.keyEnd)
+	// First check if we've reached the end of valid keys
+	if bytes.Compare(key, sc.keyEnd) > 0 {
+		return false
+	}
+
+	// Check if we're still within range
+	if bytes.Compare(key, sc.keyStart) < 0 {
+		return false
+	}
+
+	return true
 }
 
-// move the underlying B-tree iterator
 func (sc *Scanner) Next() {
-	if !sc.Valid() {
+	if !sc.iter.Valid() {
 		return
 	}
-	if sc.Cmp1 > 0 {
-		sc.iter.Next()
-	} else {
-		sc.iter.Prev()
+
+	currentKey, _ := sc.iter.Deref()
+	sc.iter.Next()
+
+	// If after moving Next(), we get the same key or invalid iterator,
+	// we've reached the end of valid data
+	if !sc.iter.Valid() {
+		return
+	}
+
+	nextKey, _ := sc.iter.Deref()
+	if bytes.Equal(currentKey, nextKey) {
+		// If we get the same key, invalidate iterator to stop
+		sc.iter = &BIter{}
+		return
 	}
 }
 
 // fetch the current row
-func (sc *Scanner) Deref(rec *Record) {
+func (sc *Scanner) Deref(rec *Record, tree *BTree) {
 	if !sc.Valid() {
 		return
 	}
-
+	tdef := sc.tdef
+	rec.Cols = tdef.Cols
+	rec.Vals = rec.Vals[:0]
 	key, val := sc.iter.Deref()
+	if sc.indexNo < 0 {
+		values := make([]Value, len(rec.Cols))
+		for i := range rec.Cols {
+			values[i].Type = tdef.Types[i]
+		}
+		decodeValues(key[4:], values[:tdef.PKeys])
+		decodeValues(val, values[tdef.PKeys:])
+		rec.Vals = append(rec.Vals, values...)
+	} else {
+		index := tdef.Indexes[sc.indexNo]
+		ival := make([]Value, len(index))
+		for i, col := range index {
+			ival[i].Type = tdef.Types[ColIndex(tdef, col)]
+		}
+		decodeValues(key[4:], ival)
+		icol := Record{index, ival}
 
-	// Decode primary-key columns from the key.
-	pkeyVals, err := decodeKey(key, sc.tdef.Types[:sc.tdef.PKeys])
-	if err != nil {
-		return
+		rec.Cols = rec.Cols[:tdef.PKeys]
+		for _, col := range rec.Cols {
+			rec.Vals = append(rec.Vals, *icol.Get(col))
+		}
+
+		ok, err := dbGet(sc.db, tdef, rec, tree)
+		if !ok && err != nil {
+			fmt.Println("Error getting record from DB")
+		}
 	}
-
-	// Decode non-primary-key columns from the value.
-	otherVals, err := decodeValues(val, sc.tdef.Types[sc.tdef.PKeys:])
-	if err != nil {
-		return
-	}
-
-	rec.Cols = append(rec.Cols[:0], sc.tdef.Cols...)
-	rec.Vals = append(rec.Vals[:0], pkeyVals...)
-	rec.Vals = append(rec.Vals, otherVals...)
 }
 
 // B-Tree Iterator
@@ -127,11 +164,8 @@ func (iter *BIter) Valid() bool {
 	if len(iter.path) == 0 {
 		return false
 	}
-
-	last := iter.path[len(iter.path)-1]
-
-	return last.data != nil &&
-		iter.pos[len(iter.pos)-1] < last.nKeys()
+	lastNode := iter.path[len(iter.path)-1]
+	return lastNode.data != nil && iter.pos[len(iter.pos)-1] < lastNode.nKeys()
 }
 
 // moving backward and forward
@@ -187,7 +221,7 @@ func cmpOK(key []byte, cmp int, ref []byte) bool {
 	case CMP_LE:
 		return r <= 0
 	default:
-		panic("what?")
+		panic("wrong comparison")
 	}
 }
 
